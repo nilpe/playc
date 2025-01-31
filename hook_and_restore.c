@@ -92,19 +92,25 @@ __attribute__((noreturn)) void hook_handler(HookEntry *entry) {
                PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
     perror("mprotect in hook_handler");
   }
-  /* 元のコードを復元 */
+
+  // フックした際に上書きされたコードを元に戻す
   memcpy(entry->addr, entry->orig_code, sizeof(entry->orig_code));
   __builtin___clear_cache(entry->addr,
                           (char *)entry->addr + sizeof(entry->orig_code));
 
-  /* フック解除済みとする（以降は通常実行） */
+  // フック解除済みとする（以降は通常実行）
   entry->hooked = 0;
 
-  /* 初回呼び出し時の出力 */
+  // 初回呼び出し時の出力
   printf("Function %s called for the first time.\n", entry->name);
 
-  /* 元の関数へジャンプ（引数，レジスタはそのまま引き継ぐ） */
-  __asm__ volatile("jmp *%0\n" : : "r"(entry->addr));
+  // 自身のスタックフレームを取り除いてから元の関数に飛ぶ（tail-call）
+  __asm__ volatile(
+      "leave\n" // 現在のフレームを破棄（mov %rbp, %rsp; pop %rbp ）
+      "jmp *%0\n" // entry->addr にジャンプ
+      :
+      : "r"(entry->addr)
+      : "memory");
   __builtin_unreachable();
 }
 
@@ -121,6 +127,9 @@ __attribute__((noreturn)) void hook_handler(HookEntry *entry) {
 static void hook_function(HookEntry *entry) {
   /* 自ライブラリ内の関数はフック対象から除外する（例えば自分自身，hook_handlerなど）
    */
+  if (entry->addr == 0 || entry->name[0] == '\0') {
+    return;
+  }
   if (strstr(entry->name, "hook_handler") ||
       strstr(entry->name, "hook_function") ||
       strstr(entry->name, "init_hook_all")) {
@@ -156,6 +165,7 @@ static void hook_function(HookEntry *entry) {
   /* 対象関数の先頭14バイトにジャンプ命令を書き込む */
   install_jump(entry->addr, trampoline, entry->orig_code);
   entry->hooked = 1;
+  printf("Hooked: %s\n", entry->name);
 }
 
 /*
@@ -217,16 +227,6 @@ __attribute__((constructor)) void init_hook_all(void) {
   const char *strtab = (char *)data + strtab_sh->sh_offset;
   size_t num_symbols = symtab_sh->sh_size / sizeof(Elf64_Sym);
 
-  /* PIE対応：実行時のベースアドレスを取得する */
-  Dl_info info;
-  if (dladdr((void *)&init_hook_all, &info) == 0) {
-    fprintf(stderr, "dladdr failed\n");
-    munmap(data, st.st_size);
-    close(fd);
-    return;
-  }
-  uintptr_t base = (uintptr_t)info.dli_fbase;
-
   /* まずフック対象となる関数数を数える */
   size_t count = 0;
   for (size_t i = 0; i < num_symbols; i++) {
@@ -257,11 +257,7 @@ __attribute__((constructor)) void init_hook_all(void) {
         continue;
 
       g_hooks[idx].name = strdup(name);
-      // 特殊シンボルやライブラリ自身の関数を除外
-      if (strcmp(name, "_start") == 0 || strcmp(name, "_init") == 0 ||
-          strcmp(name, "_fini") == 0) {
-        continue;
-      }
+
       // シンボルテーブル Elf64_Sym における st_size
       // => 関数の大きさが記録されている（実行時のマシンコード長）
       if (symtab[i].st_size < 14) {
